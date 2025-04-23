@@ -1,0 +1,700 @@
+---
+title: "A tutorial on using the PTDBoot Package"
+author: "Dan Kluger"
+date: "4/23/2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This tutorial provides examples explaining how to run the Predict-Then-Debias bootstrap methods from the 2025 paper titled ["Prediction-Powered Inference
+with Imputed Covariates and Nonuniform Sampling"](https://arxiv.org/abs/2501.18577) by Dan M. Kluger, Kerri Lu, Tijana Zrnic, Sherrie Wang, and Stephen Bates. We start by loading a package with functions that implement the Predict-Then-Debias bootstrap and then walk through examples where the Predict-Then-Debias bootstrap is applied.
+
+```{r,message=FALSE}
+#Load PTDBoot Package from git hub
+library(devtools)
+devtools::install_github("DanKluger/PTDBoot")
+library(PTDBoot)
+```
+
+```{r,message=FALSE}
+#Loading other packages for plotting, formatting and fitting regressions
+library(survey)
+library(lmtest)
+library(tictoc)
+library(sandwich)
+library(ggplot2)
+library(dplyr)
+library(quantreg)
+```
+
+
+
+
+# 1) Housing price regressions
+```{r}
+#Set random number generation seed for Section 1
+set.seed(1)
+```
+
+
+The first example involves a setting where we are interested in estimating the regression coefficients when regressing housing price on income, nightlights, and road length. The dataset comes from [Rolf et al. (2021)](https://www.nature.com/articles/s41467-021-24638-z) and data was downloaded via this [link]( https://www.codeocean.com/capsule/6456296/tree/v2). We load a processed version of the dataset with $M=46,418$ samples, where each sample corresponds to a distinct 1 km x 1 km grid cell in the United States.
+
+
+```{r}
+#Loading data
+load(paste0(getwd(),"/Processed_Datasets/HousingPrice.RData"))
+
+# "Ground truth" data based on gold standard sources
+Data_AllSamples <- HousingPriceFormatted$GoodDat
+head(Data_AllSamples)
+
+# Imputed dataset where nightlight and road length are predictions from a machine learning model developed in Rolf et al. (2021)
+Predictions_AllSamples <- HousingPriceFormatted$ProxyDat
+
+head(Predictions_AllSamples)
+```
+
+
+Note that housing price and income measurements are the same gold standard measurements in both datasets. The nightlight predictions and road length estimates (based on a machine learning model applied to daytime satellite imagery) do not have perfect agreement with the gold standard measurements.
+```{r}
+all.equal(Data_AllSamples$HousingPrice,Predictions_AllSamples$HousingPrice) 
+all.equal(Data_AllSamples$Income,Predictions_AllSamples$Income)
+cor(Data_AllSamples$Nightlights,Predictions_AllSamples$Nightlights) #Pearson correlation
+cor(Data_AllSamples$RoadLength,Predictions_AllSamples$RoadLength)  #Pearson correlation
+```
+
+The Predict-Then-Debias bootstrap focuses on settings where the gold standard measurements are only available for a small number of samples (called the complete samples). The other samples where the gold standard measurements are missing are referred to as the incomplete samples. We consider a random subset of $N=5,000$ samples of 1 km x 1 km grid cells from the previously loaded dataset, and assume the gold standard measurements are only available for roughly 10 percent of those samples.
+
+```{r}
+N <- 5000
+#Consider random subset of the data of size 5,000
+idx_keep <- sample(1:nrow(Data_AllSamples),size = N,replace = F) 
+
+#Set only about 10% of these subsamples to be "complete" where the gold standard measurements are observed
+idx_goldStanard_obs <- I(runif(N)<0.1) 
+idx_Complete <- idx_keep[idx_goldStanard_obs]
+idx_Incomplete <- idx_keep[!idx_goldStanard_obs]
+
+# Gold standard measurements on the complete samples
+GoodDat_completeSamp <- Data_AllSamples[idx_Complete,]
+
+# Data from the complete sample where nightlights and road length measurements are replaced by their machine learning-based predictions
+PredictionDat_completeSamp <- Predictions_AllSamples[idx_Complete,]
+
+# Measurements on the incomplete sample where nightlights and road length "measurements" are unavailable but imputed using their machine learning-based predictions
+PredictionDat_incompleteSamp <- Predictions_AllSamples[idx_Incomplete,]
+```
+
+
+
+
+## 1.1) Linear regression example
+
+We now consider a setting where we wish to estimate the best fit regression coefficients in the following linear model $$Y_{\text{Housing Price}}=\beta_0 +\beta_1 X_{\text{Income}}+\beta_2 X_{\text{Nightlights}}+\beta_3 X_{\text{Road Length}}+\varepsilon,$$ where $\varepsilon$ is assumed to be mean $0$ noise that is uncorrelated with the covariates. Regardless of whether the data is truly linear, $\beta_0,\beta_1,\beta_2$ and $\beta_3$ are well defined parameters of interest giving the solution to $$(\beta_0,\beta_1,\beta_2,\beta_3)=\arg\min_{(b_0,b_1,b_2,b_3)  \in \mathbb{R}^4} \mathbb{E} \Big[ \big( Y_{\text{Housing Price}}-b_0 +b_1 X_{\text{Income}}+b_2 X_{\text{Nightlights}}-b_3 X_{\text{Road Length}} \big)^2 \Big].$$
+
+The true beta (or a close estimate of it) can be found by running a linear regression on all the data. 
+```{r}
+betaTrue <- lm(formula = "HousingPrice ~ Income + Nightlights +RoadLength",data = Data_AllSamples)$coefficients
+```
+
+However we assume a setting where much fewer samples ($N=5,000$) are available and moreover gold standard measurements are only available on roughly 10 percent of those $N=5,000$ samples. Thus `betaTrue` will be used later for validation, but the data that is not assumed to be available is removed below and subsequently withheld.
+
+```{r}
+#Removing data that is assumed to be unavailable in our motivating settings 
+rm(Data_AllSamples,Predictions_AllSamples,HousingPriceFormatted)
+```
+
+Since our current goal is to estimate a regression coefficient vector from a generalized linear model, we can use the `PTD_bootstrap.glm()` function, which specifically implements the Predict-Then-Debias bootstrap for generalized linear models. (In Section 1.2, we will demonstrate how to implement the Predict-Then-Debias for estimation tasks beyond generalized linear models). To run the `PTD_bootstrap.glm()` function you must input the 3 component datasets (the gold standard dataset from the small complete sample, the prediction-based dataset from the small complete sample, and the prediction-based dataset from the much larger incomplete sample), specify the GLM type using `GLM_type` as either `"linear"`, `"logistic"`, or `"Poisson"`, and set `regFormula.glm` to be a character string of the regression formula (using [standard notation](https://www.datacamp.com/tutorial/r-formula-tutorial) for regression formulas in R that is used in the `lm()` and `glm()` functions).
+
+```{r}
+alphaSig <- 0.05 # will construct (1-alpha)x100 % confidence intervals
+
+tic() #Start tracking runtime
+PTD_ests_CIs <- PTD_bootstrap.glm(true_data_completeSamp = GoodDat_completeSamp,
+                  predicted_data_completeSamp = PredictionDat_completeSamp,
+                  predicted_data_incompleteSamp = PredictionDat_incompleteSamp,
+                  regFormula.glm = "HousingPrice ~ Income + Nightlights +RoadLength",
+                  GLM_type = "linear",alpha = alphaSig,TuningScheme = "Diagonal")
+toc() #End tracking runtime
+```
+The `PTD_bootstrap.glm()` function (as well as other functions in the package) return point estimates, $(1-\alpha) \times 100 \%$ confidence intervals based on the Predict-Then-Debias Bootstrap, and an estimate of the tuning matrix that was used (the default is to estimate the optimal diagonal tuning matrix, but the package also allows for the setting `TuningScheme` to be `"Optimal"` which uses an estimate of the optimal tuning matrix or `"none"` which uses an identity tuning matrix). We print the output below.
+
+```{r}
+print(PTD_ests_CIs)
+```
+
+We now compare estimator and confidence intervals from the Predict-Then-Debias approach to those from two natural baselines.
+
+i) The *classical approach* of estimating the regression coefficients using the small complete sample.
+ii) The *naive approach* where all $N$ samples are used, but nightlights and road length are imputed using their machine learning-based predictions.
+
+```{r}
+#Calculating classical estimator and its standard errors
+classicalFit <- lm(formula = "HousingPrice ~ Income + Nightlights +RoadLength",data = GoodDat_completeSamp)
+CoefTableClassical <- coeftest(classicalFit,vcov. = sandwich)
+
+
+#Calculating naive estimator and its standard errors
+PredictionDatComb <- rbind(PredictionDat_completeSamp,PredictionDat_incompleteSamp)
+NaiveFit <- lm(formula = "HousingPrice ~ Income + Nightlights +RoadLength",data = PredictionDatComb)
+
+CoefTableNaive <- coeftest(NaiveFit,vcov. = sandwich)
+```
+
+Now we format and plot visualize results using formatting and plotting functions that will be used throughout the tutorial
+```{r}
+#Result formatting and plotting functions
+coefTabToEstsAndCIs <- function(CoefTabInp,alpha,estName="Estimate"){
+  Estimates <- CoefTabInp[,estName]
+  CIs <- cbind(CoefTabInp[,estName]-qnorm(1-alpha/2)*CoefTabInp[,'Std. Error'],
+                       CoefTabInp[,estName]+qnorm(1-alpha/2)*CoefTabInp[,'Std. Error'])
+  colnames(CIs) <- c("lower","upper")
+  return(list(Estimates=Estimates,CIs=CIs))
+}
+
+mkCIplot <- function(PTD_results,Classical_results,Naive_results,groundTruth,alpha){
+  coefNames <- names(PTD_results[['PTD_estimate']])
+  r1 <- data.frame(PTD_results[['PTD_estimate']],PTD_results[['PTD_Boot_CIs']][,'lower'],PTD_results[['PTD_Boot_CIs']][,'upper'],
+                   rep("Predict-Then-Debias",length(groundTruth)),coefNames)
+  r2 <- data.frame(Classical_results[['Estimates']],Classical_results[['CIs']][,'lower'],Classical_results[['CIs']][,'upper'],
+                   rep("Classical",length(groundTruth)),coefNames)
+  r3 <- data.frame(Naive_results[['Estimates']],Naive_results[['CIs']][,'lower'],Naive_results[['CIs']][,'upper'],
+                   rep("Naive",length(groundTruth)),coefNames)
+  
+  names(r1) <- names(r2) <- names(r3) <- c("Estimate","CI_lb","CI_ub","Method","Coefficient")
+  ResultsComb <- rbind(r1,r2,r3)
+
+  dfTrueCoef <- data.frame(groundTruth,names(groundTruth))
+  names(dfTrueCoef) <- c("GroundTruth","Coefficient")
+  dfplt <- left_join(ResultsComb,dfTrueCoef,by="Coefficient")
+  
+  dfplt$Method <- factor(dfplt$Method,levels = c("Predict-Then-Debias","Naive","Classical"))
+  ggplot(data = dfplt,mapping = aes(x=Estimate,y=Method,color=Method))+geom_point()+geom_errorbar(mapping = aes(y=Method,xmin=CI_lb,xmax=CI_ub,color=Method),width=0.1)+geom_vline(mapping = aes(xintercept=GroundTruth),lty="dashed")+facet_wrap(~Coefficient,scales = "free_x",nrow = 1)+theme_bw()+theme(panel.grid = element_blank(),axis.text.y = element_blank(),axis.text.x = element_text(size=7),legend.position = "bottom")+xlab(paste0("Estimates and ",(1-alpha)*100,"% Confidence Intervals"))+ylab("")+scale_color_manual(values = c("green","red","blue"))
+}
+
+#Formatting and plotting results from the housing price regressions
+Classical_Results_formatted <- coefTabToEstsAndCIs(CoefTableClassical,alpha = alphaSig)
+Naive_Results_formatted <- coefTabToEstsAndCIs(CoefTableNaive,alpha = alphaSig)
+
+mkCIplot(PTD_results = PTD_ests_CIs,Classical_results = Classical_Results_formatted,Naive_results = Naive_Results_formatted,groundTruth = betaTrue,alpha=alphaSig)
+```
+
+In the above plots the dashed lines correspond to the "true" regression coefficients which were estimated with the withheld gold standard dataset. The figure shows that the 95% confidence intervals from the Predict-Then-Debias approach contain the true coefficient, while being substantially narrower than the confidence intervals from the classical approach. Meanwhile the naive approach produces confidence intervals that do not always contain the true coefficient.
+
+
+## 1.2) Quantile regression example
+
+The `PTD_bootstrap.glm()` function only applies when the quantity of interest is a coefficient in a generalized linear model. The `PTD_bootstrap.glm()` function actually calls the more general `PTD_bootstrap()` function. The `PTD_bootstrap()` function is a function that takes 3 component datasets (the gold standard dataset from the small complete sample, the prediction-based dataset from the small complete sample, and the prediction-based dataset from the much larger incomplete sample) as well as a statistical estimation algorithm as inputs and runs the Predict-Then-Debias bootstrap. Using a statistical estimation algorithm as an input is a bit abstract, but essentially, an input argument for the `PTD_bootstrap()` function is itself a function that takes a sample as inputs and returns an estimate of the parameter of interest as an output. In `PTD_bootstrap.glm()`, a function taking a sample as input and returning the coefficients of interest from a generalized linear model is first defined and subsequently is passed into the `PTD_bootstrap()` function as an input argument. To use the `PTD_bootstrap()` function directly for estimators of interest beyond coefficients from generalized linear model, we can deploy a similar strategy. As an example we demonstrate how to implement the Predict-Then-Debias boostrap for quantile regression.
+
+We consider the same dataset and regression specification as before except now we consider the best fit linear model for the median of housing price given the covariates as opposed to considering the best fit linear model for the mean of the housing price given the covariates. In particular, our estimand is the vector of coefficients solving giving the solution to $$(\beta_0,\beta_1,\beta_2,\beta_3)=\arg\min_{(b_0,b_1,b_2,b_3)  \in \mathbb{R}^4} \mathbb{E} \Big[ \big| Y_{\text{Housing Price}}-b_0 +b_1 X_{\text{Income}}+b_2 X_{\text{Nightlights}}-b_3 X_{\text{Road Length}} \big| \Big].$$ These coefficients can be estimated using quantile regression when setting the quantile parameter $\tau=0.5$. 
+
+Below we write a function that takes a data sample as inputs and runs quantile regression on that input sample to return estimates of $\beta_0,\beta_1,\beta_2,\beta_3$. As a formality, such a function needs have two inputs `dfInp` and `weightsInp` in order for `PTD_bootstrap()` to subsequently be applied. `dfInp` is the input dataset. `weightsInp` is a vector of sample weights (it should have the same length as the number of rows in `dfInp`) and in settings where the sample is unweighted the input parameter `weightsInp` still needs to be defined but it can be ignored (or set to a vector of 1s).
+
+```{r}
+FitQuantRegMedian <- function(dfInp,weightsInp=NULL){
+  QuantRegFit <- rq(formula = as.formula("HousingPrice ~ Income + Nightlights + RoadLength"),data = dfInp,tau = 0.5,weights = weightsInp)
+  return(QuantRegFit$coefficients)
+}
+
+#As an example here is the classical estimator
+FitQuantRegMedian(dfInp = GoodDat_completeSamp)
+```
+
+To estimate the quantile regression coefficient vector and produce confidence intervals using the Predict-Then-Debias bootstrap, we use the `FitQuantRegMedian()` function (defined above) as an input to the `PTD_bootstrap()` function.
+
+```{r}
+#Running the Predict-Then-Debias Algorithm to fit the previously specified quantile regression model
+tic() #Start tracking runtime
+PTD_estsQuantReg_CIs <- PTD_bootstrap(EstAlgorithm = FitQuantRegMedian,
+                        true_data_completeSamp = GoodDat_completeSamp,
+                        predicted_data_completeSamp = PredictionDat_completeSamp,
+                        predicted_data_incompleteSamp = PredictionDat_incompleteSamp,
+                        alpha = alphaSig,TuningScheme = "Diagonal")
+toc() #End tracking runtime
+```
+
+Let's compare the confidence intervals from the Predict-Then-Debias approach to the two natural baselines:
+
+i) The *classical approach* of estimating the regression coefficients using the small complete sample, and
+ii) the *naive approach* where all $N$ samples are used, but nightlights and road length are imputed using their machine learning-based predictions.
+
+```{r}
+#Calculating classical estimator and its standard errors
+classicalFit <- rq(formula = "HousingPrice ~ Income + Nightlights + RoadLength",data = GoodDat_completeSamp,tau = 0.5)
+CoefTableClassical <- summary(classicalFit,se="ker")$coefficients
+
+
+#Calculating naive estimator and its standard errors
+PredictionDatComb <- rbind(PredictionDat_completeSamp,PredictionDat_incompleteSamp)
+NaiveFit <- rq(formula = "HousingPrice ~ Income + Nightlights +RoadLength",data = PredictionDatComb,tau = 0.5)
+CoefTableNaive <- summary(NaiveFit,se="ker")$coefficients
+
+#Estimating true coefficient using the withheld gold standard data
+load(paste0(getwd(),"/Processed_Datasets/HousingPrice.RData"))
+betaTrueQuantReg <- rq(formula = "HousingPrice ~ Income + Nightlights +RoadLength",
+                       data = HousingPriceFormatted$GoodDat,tau = 0.5)$coefficients
+
+#Plotting results
+
+Classical_Results_formatted <- coefTabToEstsAndCIs(CoefTableClassical,alpha = alphaSig,estName = "Value")
+Naive_Results_formatted <- coefTabToEstsAndCIs(CoefTableNaive,alpha = alphaSig,estName = "Value")
+
+mkCIplot(PTD_results = PTD_estsQuantReg_CIs,Classical_results = Classical_Results_formatted,
+         Naive_results = Naive_Results_formatted,groundTruth = betaTrueQuantReg,alpha=alphaSig)
+```
+
+In the above plots the dashed lines correspond to the "true" regression coefficients which were estimated by the withheld gold standard dataset. The figure shows that the naive approach leads to 95% confidence intervals that sometimes do not contain the true coefficient whereas the classical approach leads to wider confidence intervals than the Predict-Then-Debias approach.
+
+# 1.3) Computational speedup to the Predict-Then-Debias bootstrap
+
+When the number of samples $N$ is large the Predict-Then-Debias bootstrap can be slow because it involves running an estimation procedure on many different resamplings of a large dataset. [Kluger et al., (2025)](https://arxiv.org/abs/2501.18577), propose a computational speedup that involves bootstrapping the much smaller complete samples and using a normal approximation to resample the estimator corresponding to the incomplete samples. This computational speedup is implemented in the `PTD_bootstrap_speedup()` function (for a general class of estimation tasks) and in the `PTD_bootstrap.glm()` function for cases where the estimand of interest is the regression coefficient in a generalized linear model. 
+
+We demonstrate how to implement the computational speedup for the two previously considered examples. As demonstrated below, for generalize linear models running the computational speedup merely requires setting the parameter `speedup` to `TRUE` in the `PTD_bootstrap.glm()` function.
+```{r}
+tic() #Start tracking runtime
+PTD_speedup_ests_CIs_ <- PTD_bootstrap.glm(true_data_completeSamp = GoodDat_completeSamp,
+                  predicted_data_completeSamp = PredictionDat_completeSamp,
+                  predicted_data_incompleteSamp = PredictionDat_incompleteSamp,
+                  regFormula.glm = "HousingPrice ~ Income + Nightlights +RoadLength",
+                  GLM_type = "linear",alpha = alphaSig,TuningScheme = "Diagonal",speedup = TRUE)
+toc() #End tracking runtime
+```
+
+Implementing the speedup for the Predict-Then-Debias bootstrap in the $\tau=0.5$ quantile regression example requires modifying the `FitQuantRegMedian()` function to not only return an estimate of the coefficient vector $(\beta_0,\beta_1,\beta_2,\beta_3)$ but to also have the option of returning an estimate of the covariance matrix of the estimated coefficient vector. Typically the estimated covariance matrix should be a sandwich estimator of the covariance matrix.
+
+
+```{r}
+#Same function as before but with a logical input argument calcVCOV.
+# when calcVCOV=TRUE it returns a list with both
+#(i) the same vector of estimated regression coefficients as before (this element must be called "estimate") and
+#(ii) an estimate of the covariance matrix of the regression coefficients estimates (this element of the list must be called "VCOV")
+# when calcVCOV=FALSE the function is identical to the original "FitQuantRegMedian" function.
+FitQuantRegMedianWithCovEst <- function(dfInp,weightsInp=NULL,calcVCOV){
+  if(!calcVCOV){ 
+  QuantRegFit <- rq(formula = as.formula("HousingPrice ~ Income + Nightlights + RoadLength"),data = dfInp,tau = 0.5,weights = weightsInp)
+  return(QuantRegFit$coefficients)
+  } else {
+    QuantRegFit <- rq(formula = as.formula("HousingPrice ~ Income + Nightlights + RoadLength"),data = dfInp,tau = 0.5,weights = weightsInp)
+  covMatEst <- summary(QuantRegFit,se="ker",covariance = TRUE)$cov
+  return(list(estimate=QuantRegFit$coefficients,VCOV=covMatEst))
+  }
+}
+
+#As an example here is the classical estimator and its estimated covariance matrix
+FitQuantRegMedianWithCovEst(dfInp = GoodDat_completeSamp,calcVCOV = TRUE)
+
+#And here is the classical estimator without its estimated covariance matrix
+FitQuantRegMedianWithCovEst(dfInp = GoodDat_completeSamp,calcVCOV = FALSE)
+
+```
+To estimate the quantile regression coefficient vector and produce confidence intervals using the speedup to the Predict-Then-Debias bootstrap, we use the `FitQuantRegMedianWithCovEst()` function as an input to the `PTD_bootstrap_speedup function()`.
+
+```{r}
+#Running the Predict-Then-Debias Algorithm to fit the previously specified quantile regression model
+tic() #Start tracking runtime
+PTD_estsQuantReg_speedup_CIs <- PTD_bootstrap_speedup(EstAlgorithm = FitQuantRegMedianWithCovEst,
+                        true_data_completeSamp = GoodDat_completeSamp,
+                        predicted_data_completeSamp = PredictionDat_completeSamp,
+                        predicted_data_incompleteSamp = PredictionDat_incompleteSamp,
+                        alpha = alphaSig,TuningScheme = "Diagonal")
+toc() #End tracking runtime
+```
+
+
+In the linear regression example the computational speedup had roughly a 65% reduction in runtime whereas in the quantile regression example the computational speedup had roughly an 85% reduction in runtime. (The runtime advantages would be even greater if the incomplete sample were larger and the number of complete samples where held fixed). [Kluger et al. (2025)](https://arxiv.org/abs/2501.18577) shows that the confidence intervals with the speedup are similar to those obtained without the speedup and also have the same theoretical coverage guarantees.
+
+# 2) Examples with nonuniform sampling
+
+```{r}
+#set random number generation seed for Section 2
+set.seed(2)
+```
+
+In the previous example the data were assumed to be an IID draw from a super population and the gold standard data was withheld based on IID Bernoulli trials. Therefore the complete sample and incomplete samples were IID draws from the same distribution. In many applications, the ground truth labels (or gold standard measurements) are not observed according to IID Bernoulli trials or uniform random sampling. In [Kluger et al. (2025)](https://arxiv.org/abs/2501.18577), extensions of the Predict-Then-Debias bootstrap are developed for cases where the ground truth labels were collected according to either weighted random sampling, clustered random sampling, or stratified random sampling. In this section, we describe these random sampling settings in more detail and demonstrate how to implement the Predict-Then-Debias bootstrap in such settings.
+
+## 2.1) Adjusting for weighted labelling
+
+As an illustrative example of weighted labelling, we consider a setting where we are interested in estimating the coefficients when running a logistic regression of internal protein region disorder on ubiquitination, acetylation and an interaction between ubiquitination and acetylation. The dataset comes originated in [Bludau et al. (2022)]( https://pmc.ncbi.nlm.nih.gov/articles/PMC9135334/), was studied and processed in [Angelopolous et al. (2023)]( https://www.science.org/doi/10.1126/science.adi6000) and was data downloaded from [Zenodo]( https://zenodo.org/records/8397451). We load a processed version of the dataset with $M=10,802$ samples, where each sample has a gold standard measurement of whether the protein region is an internally disordered region (IDR), an AlphaFold-based prediction of IDR, and measurements of whether the samples were ubiquitinated and acetylated. The dataset is loaded below, and we also remove data loaded in previous sections.
+
+```{r}
+#Removing earlier data
+rm(list = setdiff(ls(), lsf.str())) #Removing all stored variables except functions
+
+#loading data
+load(paste0(getwd(),"/Processed_Datasets/AlphaFold.RData"))
+
+# "Ground truth" data based on gold standard sources
+Data_AllSamples <- AlphaFoldFormatted$GoodDat %>% mutate(`ubiq:acet_interaction`=NULL)
+head(Data_AllSamples)
+
+# Imputed dataset where IDR is an AlphaFold-based prediction
+Predictions_AllSamples <- AlphaFoldFormatted$ProxyDat %>% mutate(`ubiq:acet_interaction`=NULL)
+
+head(Predictions_AllSamples)
+
+#Note that ubiquitination and acetylation measurements are the same gold standard measurements in both datasets, but the IDR estimates based on AlphaFold do not have perfect agreement with the gold standard measurements.
+
+all.equal(Data_AllSamples$ubiquitinated,Predictions_AllSamples$ubiquitinated) 
+all.equal(Data_AllSamples$acetylated,Predictions_AllSamples$acetylated)
+table(Data_AllSamples$IDR,Predictions_AllSamples$IDR) #Confusion Matrix
+```
+
+We wish to estimate the best fit coefficients in the following logistic regression model $$\mathbb{P}(Y_{\text{IDR}}=1 | X) =\frac{\exp\Big(\beta_0 +\beta_1 X_{\text{Ubiquinated}}+\beta_2 X_{\text{Acetylated}}+\beta_3 X_{\text{Ubiquinated}} * X_{\text{Acetylated}} \Big)}{1+\exp\Big(\beta_0 +\beta_1 X_{\text{Ubiquinated}}+\beta_2 X_{\text{Acetylated}}+\beta_3 X_{\text{Ubiquinated}} * X_{\text{Acetylated}} \Big)}.$$ Regardless of whether the data truly follows a logistic regression model, $\beta_0,\beta_1,\beta_2$ and $\beta_3$ are well defined parameters of interest. In particular letting $Z\equiv(1,X_{\text{Ubiquinated}},X_{\text{Acetylated}},X_{\text{Ubiquinated}}*X_{\text{Acetylated}})$, $\beta_0,\beta_1,\beta_2$ and $\beta_3$ give the solution to $$(\beta_0,\beta_1,\beta_2,\beta_3)=\arg\min_{\mathbf{v}  \in \mathbb{R}^4} \mathbb{E} \Big[ \log\big( 1+e^{ \mathbf{v}^T Z} \big) -Y_{\text{IDR}} * \mathbf{v}^T Z \Big].$$
+
+The true beta (or a close estimate of it) can be found by running a logistic regression with an interaction term on all the data. 
+
+```{r}
+betaTrue <- glm(formula = "IDR ~ ubiquitinated * acetylated",family = binomial(link = "logit"),data = Data_AllSamples)$coefficients
+```
+
+
+The Predict-Then-Debias bootstrap focuses on settings where the gold standard measurements are only available for a small number of samples (called the complete samples). The other samples where the gold standard measurements are missing are referred to as the incomplete samples. We consider a random subset of $N=7,500$ samples, and assume the gold standard IDR measurements are only available for roughly 1,000 of those samples (the remaining samples will have AlphaFold-based predictions of IDR). Because we are interested in estimating the interaction between ubiquitination and acetylation in the model for IDR, ideally the we should have roughly 250 samples with gold standard IDR measurments for each of the four possible combinations ubiquitination and acetylation. This can can be achieved by weighted random labelling.
+
+```{r}
+#Consider random subset of the data of size 7,500
+N <- 7500
+idx_keep <- sample(1:nrow(Data_AllSamples),size = N,replace = F)
+
+#Set sampling probabilities such that roughly 250 samples have gold standard IDR measurements for each combination of the 4 ubiquitantion and acetylation combinations
+UbiqAcetTable <- table(Data_AllSamples$ubiquitinated[idx_keep],Data_AllSamples$acetylated[idx_keep])
+LabelProbabilityTable <- 250/UbiqAcetTable
+
+#Turn labelling probabilities into a vector
+GetLabelProbabilityVec <- function(dfInp,ProbabilityTable){
+  ProbabilityVec_out <- rep(NA,nrow(dfInp))
+  for(i in 0:1){
+    for(j in 0:1){
+      idxCurr <- (dfInp$ubiquitinated==i) & (dfInp$acetylated==j)
+      ProbabilityVec_out[idxCurr] <- ProbabilityTable[as.character(i),as.character(j)]
+    }
+  }
+  return(ProbabilityVec_out)
+}
+LabelProbabilityVec <- GetLabelProbabilityVec(dfInp = Data_AllSamples[idx_keep,],ProbabilityTable = LabelProbabilityTable)
+
+idx_goldStanard_obs <- I(runif(N) < LabelProbabilityVec) 
+idx_Complete <- idx_keep[idx_goldStanard_obs]
+idx_Incomplete <- idx_keep[!idx_goldStanard_obs]
+
+# Gold standard measurements and labelling probabilities on the complete samples
+GoodDat_completeSamp <- Data_AllSamples[idx_Complete,]
+
+#Checking that the complete sample has roughly 250 samples for each combination of ubiquitanation and acetylation
+table(GoodDat_completeSamp$ubiquitinated,GoodDat_completeSamp$acetylated)
+
+# Data from the complete sample where IDR measurements are replaced by their AlphaFold-based predictions
+PredictionDat_completeSamp <- Predictions_AllSamples[idx_Complete,]
+
+
+# Measurements on the incomplete sample where IDR measurements are unavailable but imputed using their AlphaFold-based predictions
+PredictionDat_incompleteSamp <- Predictions_AllSamples[idx_Incomplete,]
+
+# To account for the fact that some samples were labelled with varying probabilities the Predict-Then-Debias bootstrap requires the labelling probabilities as inputs
+
+Prob_lab_completeSamp <- GetLabelProbabilityVec(dfInp = GoodDat_completeSamp,ProbabilityTable = LabelProbabilityTable)
+Prob_lab_incompleteSamp <- GetLabelProbabilityVec(dfInp = PredictionDat_incompleteSamp,ProbabilityTable = LabelProbabilityTable)
+
+# Removing gold standard data that is withheld and not used as inputs for the Predict-Then-Debias bootstrap
+rm(Data_AllSamples,Predictions_AllSamples,AlphaFoldFormatted)
+```
+We are now ready to run the Predict-Then-Debias bootstrap. Since we are interested in logistic regression coefficients, this can be done via the `PTD_bootstrap.glm()` function. Because the gold standard labels were collected randomly with each sample having a different probability of the label being observed, this information must be passed into the `PTD_bootstrap.glm()` function. This can be done by setting `prob_lab_completeSamp` and `prob_lab_incompleteSamp` to be vectors giving the probabilities that each individual sample in the complete sample and incomplete sample, respectively, was assigned to be labelled (i.e., given a gold standard measurement). 
+
+```{r}
+alphaSig <- 0.05 # will construct (1-alpha) x 100 % confidence intervals
+PTDBootWeightedSampling_CIs <- PTD_bootstrap.glm(true_data_completeSamp = GoodDat_completeSamp,
+                                predicted_data_completeSamp = PredictionDat_completeSamp,
+                                predicted_data_incompleteSamp = PredictionDat_incompleteSamp,
+                                regFormula.glm = "IDR ~ ubiquitinated * acetylated",
+                                GLM_type = "logistic",
+                                alpha = alphaSig,
+                                prob_lab_completeSamp = Prob_lab_completeSamp,
+                                prob_lab_incompleteSamp = Prob_lab_incompleteSamp,
+                                speedup = TRUE) #The speedup is available in weighted sampling settings
+```
+
+
+Let's compare the results to those from the classical approach (re-weighted via inverse probability weighting) and the naive approach.
+
+```{r}
+#Calculating classical estimator and its standard errors using inverse probability weighting
+classicalFit <- glm(formula = "IDR ~ ubiquitinated * acetylated",data = GoodDat_completeSamp,
+                    family = binomial(link = "logit"),weights = 1/Prob_lab_completeSamp)
+CoefTableClassical <- coeftest(classicalFit,vcov. = sandwich)
+
+
+#Calculating naive estimator and its standard errors (no inverse probability weighting needed)
+PredictionDatComb <- rbind(PredictionDat_completeSamp,PredictionDat_incompleteSamp)
+NaiveFit <- glm(formula = "IDR ~ ubiquitinated * acetylated",data = PredictionDatComb,
+                    family = binomial(link = "logit"))
+
+CoefTableNaive <- coeftest(NaiveFit,vcov. = sandwich)
+
+Classical_Results_formatted <- coefTabToEstsAndCIs(CoefTableClassical,alpha = alphaSig)
+Naive_Results_formatted <- coefTabToEstsAndCIs(CoefTableNaive,alpha = alphaSig)
+
+mkCIplot(PTD_results = PTDBootWeightedSampling_CIs,Classical_results = Classical_Results_formatted,
+         Naive_results = Naive_Results_formatted,groundTruth = betaTrue,alpha=alphaSig)
+```
+
+In the above plots the dashed lines correspond to the "true" regression coefficients which were estimated by the withheld gold standard dataset. The figure shows that the naive approach leads to 95% confidence intervals that sometimes do not contain the true coefficient whereas the classical approach leads to wider confidence intervals than the Predict-Then-Debias approach.
+
+To implement the Predict-Then-Debias approach for settings where the estimand is not a coefficient from a generalized linear model and the labels are collected according to a weighted sampling scheme, the `PTD_bootstrap()` function should be used and the `prob_lab_completeSamp` and `prob_lab_incompleteSamp` inputs of labelling probabilities need to be appropriately set. See Section 1.2 for an example of how to use the `PTD_bootstrap()` function.
+
+## 2.2) Adjusting for cluster sampling
+
+The Predict-Then-Debias bootstrap can be generalized to apply in cluster sampling settings. As an illustrative example, we suppose we are interested in estimating the coefficients when running a regression of percent treecover on elevation and population covariates. We use a dataset from [Rolf et al. (2021)](https://www.nature.com/articles/s41467-021-24638-z) that was data downloaded via this [link](https://www.codeocean.com/capsule/6456296/tree/v2). We load a processed version of the dataset with $M=67,968$ samples from the United States, where each sample corresponds to a distinct 1 km x 1 km grid cell in the United States. Each sample had a gold standard measurment of percent treecover, elevation, and population as well as satellite-based predictions of percent treecover and population. In addition, when processing this dataset we grided the United States into 0.5° by 0.5° grid cells based on latitude and longitude, and assigned a unique cluster ID to each grid cell. Latitude and longitude of each sample was used to determine the corresponding grid cell and cluster ID. The full dataset had an average of about 20 samples per cluster.
+
+```{r}
+#Removing earlier data
+rm(list = setdiff(ls(), lsf.str())) #Removing all stored variables except functions
+
+#loading data
+load(paste0(getwd(),"/Processed_Datasets/Treecover.RData"))
+
+# "Ground truth" data based on gold standard sources
+Data_AllSamples <- TreecoverFormatted$GoodDat
+head(Data_AllSamples)
+
+# Imputed dataset where treecover and population are satellite-based predictions
+Predictions_AllSamples <- TreecoverFormatted$ProxyDat
+
+head(Predictions_AllSamples)
+
+#Note that elevation measurements are the same gold standard measurements in both datasets, but the population and treecover predictions based on satellite data do not match the gold standard measurements
+
+all.equal(Data_AllSamples$Elevation,Predictions_AllSamples$Elevation) 
+cor(Data_AllSamples$Treecover,Predictions_AllSamples$Treecover)
+cor(Data_AllSamples$Population,Predictions_AllSamples$Population)
+
+#Vector of cluster IDs and average cluster size
+ClusterIDs_AllSamples <- TreecoverFormatted$ClusterIDs
+mean(table(ClusterIDs_AllSamples))
+```
+
+We wish to estimate the best fit coefficients in the following linear regression model $$Y_{\text{Treecover}}=\beta_0 +\beta_1 X_{\text{Elevation}}+\beta_2 X_{\text{Population}}+\varepsilon,$$ where $\varepsilon$ is assumed to be mean $0$ noise that is uncorrelated with the covariates. Regardless of whether the data truly follows a linear regression model, $\beta_0,\beta_1,$ and $\beta_2$ are well defined parameters of interest giving the solution to $$(\beta_0,\beta_1,\beta_2)=\arg\min_{(b_0,b_1,b_2)  \in \mathbb{R}^3} \mathbb{E} \Big[ \big( Y_{\text{Treecover}}-b_0 +b_1 X_{\text{Elevation}}+b_2 X_{\text{Population}} \big)^2 \Big].$$ The true beta vector (or a close estimate of it) can be found by running a linear regression on all the data. 
+
+```{r}
+betaTrue <- lm(formula = "Treecover ~ Elevation + Population",data = Data_AllSamples)$coefficients
+```
+
+
+
+The Predict-Then-Debias bootstrap focuses on settings where the gold standard measurements are only available for a small number of samples (called the complete samples), as collecting gold standard measurements is expensive. In some settings it more economical to obtain gold standard measurements for clusters of samples (e.g., it could be much cheaper to obtain gold standard measurements for samples that are geographically near each other rather than samples that are spread out). 
+
+We consider a where of the $M=67,968$ samples, only a random subset of the clusters are observed such that in expectation $10,000$ total samples are available. Of the observed clusters we suppose in roughly 10% of them gold standard measurements for treecover and population are collected and for the remaining observed clusters only the satellite-based estimates of these quantities are available.
+
+```{r}
+#Select number of clusters in total sample
+ExpectedN <- 10000
+N_clust_expectation <-  ExpectedN/mean(table(ClusterIDs_AllSamples))
+N_clust <- floor(N_clust_expectation)+as.numeric(I(runif(1)<(N_clust_expectation-floor(N_clust_expectation))))
+
+#Select a random subset of clusters such that the total sample size is 10,000 in expectation
+clustersKeep <- sample(unique(ClusterIDs_AllSamples),size = N_clust,replace = F)
+
+#Select which clusters in the total sample will have gold standard measurements, such that roughly 1,000 samples will have gold standard measurements
+
+n_Targ <- 1000
+probLabelClust <- n_Targ/sum(ClusterIDs_AllSamples %in% clustersKeep)
+idxClustsLabel <- I(runif(n = length(clustersKeep)) < probLabelClust)
+idx_Complete <- which(ClusterIDs_AllSamples %in% clustersKeep[idxClustsLabel])
+idx_Incomplete <-  which(ClusterIDs_AllSamples %in% clustersKeep[!idxClustsLabel])
+
+GoodDat <- Data_AllSamples[idx_Complete,]
+PredictionDat_completeSamp <- Predictions_AllSamples[idx_Complete,]
+PredictionDat_incompleteSamp <- Predictions_AllSamples[idx_Incomplete,]
+
+Clust_completeSamp <- ClusterIDs_AllSamples[idx_Complete]
+Clust_incSamp <- ClusterIDs_AllSamples[idx_Incomplete]
+
+# Note the cluster IDs for the incomplete sample do not intersect with those from the complete sample
+intersect(Clust_completeSamp,Clust_incSamp)
+
+# Removing gold standard data that is withheld and not used as inputs for the Predict-Then-Debias bootstrap
+rm(Data_AllSamples,Predictions_AllSamples,TreecoverFormatted)
+```
+
+We are now ready to run the Predict-Then-Debias bootstrap that accounts for the clustered sampling scheme used above. Since we are interested in linear regression coefficients, this can be done via the `PTD_bootstrap.glm()` function. To account for the cluster sampling scheme we must set the input arguments `GroupID_completeSamp` and `GroupID_incompleteSamp` to be vectors giving the cluster ID of each individual sample in the complete sample and incomplete sample, respectively. In addition, we must set the input argument `clustered` to be `TRUE`. The Predict-Then-Debias bootstrap is implemented below with these modifications.
+
+```{r}
+alphaSig <- 0.05 # will construct (1-alpha)x100 % confidence intervals
+PTDBoot_clustered_results <- PTD_bootstrap.glm(true_data_completeSamp = GoodDat,
+                                predicted_data_completeSamp = PredictionDat_completeSamp,
+                                predicted_data_incompleteSamp = PredictionDat_incompleteSamp,
+                                GroupID_completeSamp = Clust_completeSamp,
+                                GroupID_incompleteSamp =   Clust_incSamp,
+                                regFormula.glm = "Treecover ~ Elevation + Population",
+                                GLM_type = "linear",alpha = alphaSig ,clustered = TRUE
+                  )
+```
+
+Let's compare the results to those from the classical approach and the naive approach. Below we account for the clustering scheme when computing the standard errors for the classical and naive estimators.
+
+```{r}
+#Calculating classical estimator and its standard errors (which account for the clusters)
+classicalFit <- lm(formula = "Treecover ~ Elevation + Population",data = GoodDat)
+CoefTableClassical <- coeftest(classicalFit,vcov. = vcovCL,cluster= Clust_completeSamp,sandwich=TRUE)
+
+
+#Calculating naive estimator and its standard errors (which account for the clusters)
+PredictionDatComb <- rbind(PredictionDat_completeSamp,PredictionDat_incompleteSamp)
+ClustersComb <- c(Clust_completeSamp,Clust_incSamp)
+NaiveFit <- lm(formula = "Treecover ~ Elevation + Population",data = PredictionDatComb)
+CoefTableNaive <- coeftest(NaiveFit,vcov. = vcovCL,cluster= ClustersComb,sandwich=TRUE)
+
+Classical_Results_formatted <- coefTabToEstsAndCIs(CoefTableClassical,alpha = alphaSig)
+Naive_Results_formatted <- coefTabToEstsAndCIs(CoefTableNaive,alpha = alphaSig)
+
+mkCIplot(PTD_results = PTDBoot_clustered_results,Classical_results = Classical_Results_formatted,
+         Naive_results = Naive_Results_formatted,groundTruth = betaTrue,alpha=alphaSig)
+```
+
+In the above plots the dashed lines correspond to the "true" regression coefficients which were estimated by the withheld gold standard dataset. The figure shows that the Predict-Then-Debias 95% confidence intervals indeed contain the true coefficient and are much smaller than the confidence intervals from the classical approach.
+
+In cluster sampling settings, to implement the Predict-Then-Debias approach to estimate a quantity other than a regression coefficient from a generalized linear model, the `PTD_cluster_bootstrap()` function should be used and the `clusterID_completeSamp` and `clusterID_incompleteSamp` inputs of cluster IDs need to be appropriately set. Using `PTD_cluster_bootstrap()` requires using a function that runs a statistical estimation procedure as an input argument (see Section 1.2 for an example of how to use the similar `PTD_bootstrap()` function).
+
+## 2.3) Adjusting for stratified sampling
+
+The Predict-Then-Debias bootstrap can also be generalized to settings where the data was sampled according to a stratified sampling scheme provided that there is a small number of large strata. As an illustrative example, we suppose we are interested in estimating the coefficients when running a regression of income on age and disability status. We use a dataset from California taken from the 2019 US Census survey and downloaded via the [Folktables interface](https://proceedings.neurips.cc/paper_files/paper/2021/file/32e54441e6382a7fbacbbbaf3c450059-Paper.pdf) ([Folktables repository](https://github.com/socialfoundations/folktables)). We load a processed version of the dataset with $M=200,227$ individuals from California between ages 25 and 64 with gold standard measurements of income, age, and disability status as well as a prediction of disability status based on a Random Forest that was trained using 2018 census data from California. (See [Kluger et al., 2025](https://arxiv.org/abs/2501.18577) and the corresponding reproducibility code for more details on how machine learning-based disability status predictions were produced). 
+
+We now load the data and define four distinct strata based on the age: subjects aged 25--34, subjects aged 35--44, subjects aged 45--54, and subjects aged 55--64.
+
+```{r}
+#Removing earlier data
+rm(list = setdiff(ls(), lsf.str())) #Removing all stored variables except functions
+
+#loading data
+load(paste0(getwd(),"/Processed_Datasets/CensusIncome.RData"))
+
+# "Ground truth" data based on gold standard sources
+Data_AllSubjects <- IncomeDatFormatted$GoodDat
+head(Data_AllSubjects)
+
+# Imputed dataset where disability status is imputed with machine learning predictions
+Predictions_AllSubjects <- IncomeDatFormatted$ProxyDat
+
+head(Predictions_AllSubjects)
+
+#Note that age and income measurements are the same gold standard measurements in both datasets. Meanwhile the disability status variable differs between the two datasets
+
+all.equal(Data_AllSubjects$Income,Predictions_AllSubjects$Income) 
+all.equal(Data_AllSubjects$Age,Predictions_AllSubjects$Age)
+table(Data_AllSubjects$Disability,Predictions_AllSubjects$Disability) #Confusion matrix
+
+#Vector of strata IDs 
+StrataIDs_AllSubjects <- rep(NA,nrow(Data_AllSubjects))
+StrataIDs_AllSubjects[(Data_AllSubjects$Age < 35) & (Data_AllSubjects$Age >= 25) ] <- "1"
+StrataIDs_AllSubjects[(Data_AllSubjects$Age < 45) & (Data_AllSubjects$Age >= 35) ] <- "2"
+StrataIDs_AllSubjects[(Data_AllSubjects$Age < 55) & (Data_AllSubjects$Age >= 45) ] <- "3"
+StrataIDs_AllSubjects[(Data_AllSubjects$Age < 65) & (Data_AllSubjects$Age >= 55) ] <- "4"
+
+#We will also later need a table of the strata sizes
+StrataSizeTab <- table(StrataIDs_AllSubjects)
+print(StrataSizeTab)
+
+#Visualizing the strata
+ggplot(aes(x=Age), data = Data_AllSubjects %>% mutate(StrataID=as.character(StrataIDs_AllSubjects)))+geom_histogram(mapping = aes(fill=StrataID),bins = 100)+theme_bw()+ggtitle("Histogram of age colored by Strata")
+
+
+```
+
+
+We wish to estimate the best fit coefficients in the following linear regression model $$Y_{\text{Income}}=\beta_0 +\beta_1 X_{\text{Age}}+\beta_2 X_{\text{Disability}}+\varepsilon,$$ where $\varepsilon$ is assumed to be mean $0$ noise that is uncorrelated with the covariates. Regardless of whether the data truly follows a linear regression model, $\beta_0,\beta_1,$ and $\beta_2$ are well defined parameters of interest giving the solution to $$(\beta_0,\beta_1,\beta_2)=\arg\min_{(b_0,b_1,b_2)  \in \mathbb{R}^3} \mathbb{E} \Big[ \big( Y_{\text{Income}}-b_0 +b_1 X_{\text{Age}}+b_2 X_{\text{Disability}} \big)^2 \Big].$$ The true beta vector (or a close estimate of it) can be found by running a linear regression on all the data. 
+
+```{r}
+betaTrue <- lm(formula = "Income ~ Age + Disability",data = Data_AllSubjects)$coefficients
+```
+
+
+
+The Predict-Then-Debias bootstrap focuses on settings where the gold standard measurements are only available for a small number of samples (called the complete samples), as collecting gold standard measurements is expensive. We consider a setting where of the $M=200,227$ subjects, only a random sample of the $6,000$ of the subjects are observed and of those $N=6,000$ samples, gold standard disability measurements are are made on only $1,000$ of those samples. Given that stratified sampling is common for survey data, we supposed that within each of the 4 age strata, $1,500$ samples were collected randomly without replacement, and among those $1,500$ samples $250$ were randomly selected to have gold standard disability status measurements. This random stratified sampling scheme is implemented below.
+
+```{r}
+N_strat <- 1500 #Number of samples per strata
+n_strat <- 250  #Number of samples per strata with gold standard measurements for disability status
+StrataIDsUnique <- unique(StrataIDs_AllSubjects)
+idx_complete <- vector()
+idx_incomplete <- vector()
+for(i in 1:length(StrataIDsUnique)){
+  
+  #Randomly sample subjects without replacement within the current strata
+  idxAllCurrStrat <- which(StrataIDs_AllSubjects==StrataIDsUnique[i])
+  idxKeepCurr <- sample(idxAllCurrStrat,size = N_strat,replace = F)
+  
+  #Randomly select a subset of the included subjects to have gold standard disability status measurements
+  idxCompleteCurr <- sample(idxKeepCurr,size = n_strat,replace = F)
+  idxIncompleteCurr <- idxKeepCurr[!(idxKeepCurr %in% idxCompleteCurr)]
+  
+  idx_complete <- c(idx_complete,idxCompleteCurr)
+  idx_incomplete <- c(idx_incomplete,idxIncompleteCurr)
+}
+
+
+GoodDat <- Data_AllSubjects[idx_complete,]
+PredictionDat_completeSamp <- Predictions_AllSubjects[idx_complete,]
+PredictionDat_incompleteSamp <- Predictions_AllSubjects[idx_incomplete,]
+
+StrataIDs_completeSamp <- StrataIDs_AllSubjects[idx_complete]
+StrataIDs_incSamp <- StrataIDs_AllSubjects[idx_incomplete]
+
+# Note the number of complete and incomplete samples per strata is the same across all 4 strata
+table(StrataIDs_completeSamp)
+table(StrataIDs_incSamp)
+
+# Removing gold standard data that is withheld and not used as inputs for the Predict-Then-Debias bootstrap
+rm(Data_AllSubjects,Predictions_AllSubjects,IncomeDatFormatted)
+```
+We are now ready to run the Predict-Then-Debias bootstrap that accounts for the stratified sampling scheme used above. Since we are interested in linear regression coefficients, this can be done via the `PTD_bootstrap.glm()` function. To account for the stratified sampling scheme we must set the input arguments `GroupID_completeSamp` and `GroupID_incompleteSamp` to be vectors giving the strata ID of each individual sample in the complete sample and incomplete sample, respectively. In addition, we must set the input argument `stratified` to be `TRUE` and to set `TotalStrataSizes` to be table of the strata sizes in the larger population from which the stratified sample was drawn (note this table must be a named vector with names that correspond to the strata names). The Predict-Then-Debias bootstrap is implemented below with these modifications.
+
+```{r}
+alphaSig <- 0.05 # will construct (1-alpha)x100 % confidence intervals
+PTDBoot_stratified_results <- PTD_bootstrap.glm(true_data_completeSamp = GoodDat,
+                                predicted_data_completeSamp = PredictionDat_completeSamp,
+                                predicted_data_incompleteSamp = PredictionDat_incompleteSamp,
+                                GroupID_completeSamp = StrataIDs_completeSamp,
+                                GroupID_incompleteSamp =   StrataIDs_incSamp,TotalStrataSizes = StrataSizeTab,
+                                regFormula.glm = "Income ~ Age + Disability",
+                                GLM_type = "linear",alpha = alphaSig,stratified = TRUE
+                  )
+```
+
+
+Let's compare the results to those from the classical approach and the naive approach. Below we account for the stratified sampling scheme when computing the standard errors for the classical and naive estimators.
+```{r}
+
+#Calculating classical estimator and its standard errors, accounting for the stratified sampling
+prob_vec_completeSamp <- rep(NA,nrow(GoodDat))
+for(i in 1:length(StrataSizeTab)){
+  prob_vec_completeSamp[StrataIDs_completeSamp==names(StrataSizeTab)[i]] <- n_strat/StrataSizeTab[i]
+}
+
+CoefTableClassical <- summary(svyglm(formula = "Income ~ Age + Disability",
+      design = svydesign(id= ~1, strata = StrataIDs_completeSamp,data = GoodDat,
+                         weights = 1/prob_vec_completeSamp)))$coefficients
+
+
+#Calculating naive estimator and its standard errors, accounting for the stratified sampling
+PredictionDatComb <- rbind(PredictionDat_completeSamp,PredictionDat_incompleteSamp)
+StrataComb <- c(StrataIDs_completeSamp,StrataIDs_incSamp)
+prob_vec_CombSamp <- length(StrataComb)
+for(i in 1:length(StrataSizeTab)){
+  prob_vec_CombSamp[StrataComb==names(StrataSizeTab)[i]] <- N_strat/StrataSizeTab[i]
+}
+CoefTableNaive <- summary(svyglm(formula = "Income ~ Age + Disability",
+      design = svydesign(id= ~1, strata = StrataComb,data = PredictionDatComb,
+                         weights = 1/prob_vec_CombSamp)))$coefficients
+
+
+Classical_Results_formatted <- coefTabToEstsAndCIs(CoefTableClassical,alpha = alphaSig)
+Naive_Results_formatted <- coefTabToEstsAndCIs(CoefTableNaive,alpha = alphaSig)
+
+mkCIplot(PTD_results = PTDBoot_stratified_results,Classical_results = Classical_Results_formatted,
+         Naive_results = Naive_Results_formatted,groundTruth = betaTrue,alpha=alphaSig)
+```
+
+In the above plots the dashed lines correspond to the "true" regression coefficients which were estimated by the withheld gold standard dataset. The figure shows that the Predict-Then-Debias 95% confidence intervals indeed contain the true coefficient and are much smaller than the confidence intervals from the classical approach.
+
+In stratified sampling settings, to implement the Predict-Then-Debias bootstrap for estimands other than regression coefficients from a generalized linear model, the `PTD_stratified_bootstrap()` function should be used and the `StrataID_completeSamp`, `StrataID_incompleteSamp`, and `TotalStrataSizes` inputs of strata IDs and strata sizes need to be appropriately set. Using `PTD_stratified_bootstrap()` requires using a function that runs a statistical estimation procedure as an input argument (see Section 1.2 for an example of how to use the similar `PTD_bootstrap()` function).
