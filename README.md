@@ -23,3 +23,12 @@ Prediction-powered inference: Data sets. 10.5281/zenodo.8397451.
 The Census income dataset was from an official US survey, but was downloaded using the Folktables interface:
 > Ding, F., Hardt, M., Miller, J., and Schmidt, L. (2021). Retiring adult: New datasets for
 fair machine learning. In Advances in Neural Information Processing Systems.
+
+Note that for each of these datasets, [additional processing steps](https://github.com/DanKluger/Predict-Then-Debias_Bootstrap/blob/main/Datasets/ReadAndProcessData.Rmd) were taken before uploading the data to this repository. 
+
+## Software citations
+
+The software and PTDBoot package should be attributed to:
+
+> Dan M. Kluger, Kerri Lu, Tijana Zrnic, Sherrie Wang, and Stephen Bates (2025). Prediction-Powered Inference with Imputed Covariates and Nonuniform Sampling. 2501.18577 [stat.ME]  [https://arxiv.org/abs/2501.18577](https://arxiv.org/abs/2501.18577)
+I
