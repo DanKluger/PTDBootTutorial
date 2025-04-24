@@ -31,4 +31,3 @@ Note that for each of these datasets, [additional processing steps](https://gith
 The software and PTDBoot package should be attributed to:
 
 > Dan M. Kluger, Kerri Lu, Tijana Zrnic, Sherrie Wang, and Stephen Bates (2025). Prediction-Powered Inference with Imputed Covariates and Nonuniform Sampling. 2501.18577 [stat.ME]  [https://arxiv.org/abs/2501.18577](https://arxiv.org/abs/2501.18577)
-I
