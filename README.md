@@ -1,6 +1,6 @@
 This repository has an RMarkdown file giving examples that demonstrate how to use the PTDBoot package. It also includes a folder with the processed datasets that were used in the examples.
 
-##Citations
+## Dataset citations
 
 If using the processed datasets, please cite their original source rather than this github repository.
 
