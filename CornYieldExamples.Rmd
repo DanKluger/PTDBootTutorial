@@ -1,0 +1,286 @@
+---
+title: "PTD Bootstrap Implementation: Corn Yield Examples"
+author: "Dan Kluger"
+date: "8/24/2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading packages and formatting dataset
+
+
+```{r,message=FALSE}
+#Loading PTD Bootstrap package
+devtools::install_github("DanKluger/PTDBoot")
+library(PTDBoot)
+
+#Loading other packages used
+library(dplyr)
+library(lmtest)
+library(sandwich)
+
+#packages for maps and plotting
+library(ggplot2)
+library(viridis)
+library(marmap)
+library(raster)
+library(rnaturalearth)
+```
+
+Loading the 2019 corn yield estimates from a map product developed in the following paper:
+Ma, Y., Liang, S.-Z., Myers, D. B., Swatantran, A., and Lobell, D. B. (2024). Subfield-level crop yield mapping without ground truth data: A scale transfer framework. Remote
+Sensing of Environment, 315:114427
+
+```{r}
+load("CornYieldEstimatesMidwesternUS.RData")
+```
+
+
+Synthetically generating``ground truth" yield measurements and randomly sampling $n=100$ locations where corn yields are to be measured as part of the survey.
+```{r}
+set.seed(1)
+
+#Synthetically generating the "ground truth" yield measurements
+temperature <- Yield2019Midwest$AverageGrowingSeasonTemp
+statandardizedTemperature <- (temperature-mean(temperature))/sd(temperature)
+Yield2019Midwest$TrueYield <- 1.2*Yield2019Midwest$yield_est_tha+0.5*rnorm(nrow(Yield2019Midwest))-3-0.15*statandardizedTemperature
+Yield2019Midwest$TrueYield[Yield2019Midwest$TrueYield<0] <- 0
+
+
+
+#Determining which 100 locations are going to be included in the sample
+idxSurvey <- sample(1:nrow(Yield2019Midwest),size = 100,replace = F)
+
+```
+
+Below we visualize the corn yield map product and survey locations. The black dots correspond to the randoly selected survey locations.
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+gridify_inp <- data.frame(Yield2019Midwest$longitude,Yield2019Midwest$latitude,Yield2019Midwest$yield_est_tha) 
+names(gridify_inp) <- c("lon","lat","Y")
+
+
+plt_pixel_size <- 0.1 #In degrees
+range_lat <- c(min(gridify_inp$lat),max(gridify_inp$lat))
+range_lon <-  c(min(gridify_inp$lon),max(gridify_inp$lon))
+
+nlat_inp <- round((range_lat[2]-range_lat[1])/plt_pixel_size)
+nlon_inp <- round((range_lon[2]-range_lon[1])/plt_pixel_size)
+
+
+temp_raster <- marmap::griddify(xyz = gridify_inp,nlon = nlon_inp,nlat = nlat_inp) 
+raster_df <- fortify(as.bathy(temp_raster))
+names(raster_df) <- c("lon","lat","Z")
+
+
+US_States <- sf::st_as_sf(maps::map("state", plot = FALSE, fill = TRUE))
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+
+
+SurveyedPointLocs <- data.frame(Yield2019Midwest$longitude[idxSurvey],Yield2019Midwest$latitude[idxSurvey])
+names(SurveyedPointLocs) <- c("lon","lat")
+
+MapFig <- ggplot(data = world) +
+    geom_sf() +geom_sf(data = US_States, fill = NA) + 
+    coord_sf(xlim = (range_lon+c(-0.1,0.1)), ylim = (range_lat+c(-0.1,0.1)), expand = FALSE)+geom_raster(data = raster_df,aes(x=lon,y=lat,fill=Z),alpha=0.8) +scale_fill_viridis(option="D",na.value=NA)+geom_point(mapping = aes(x=lon,y=lat),data = SurveyedPointLocs)+theme_bw() +xlab("")+ylab("")+ggtitle("")+labs(fill="Estimated Corn Yield (t/ha)")
+
+print(MapFig)
+#ggsave("CornYieldMap2019AndSurveyLocations.pdf",
+#  plot = MapFig,height = 4
+#)
+```
+We next format the datasets to facilitate later use. All formatted datasets have the same column names but differ on whether the yield data are estimates from the map product versus ground truth yield data. The formatted datasets also differ on whether they correspond to all observations or just the locations in the survey or just the non-surveyed locations.
+```{r}
+#map product estimates from all locations (used for map-only estimator)
+AllProxy <- Yield2019Midwest %>% mutate(yield=yield_est_tha) %>% mutate(yield_est_tha=NULL,TrueYield=NULL)
+
+#ground truth data from survey locations (used for survey-only estimator)
+SurveyGT <- Yield2019Midwest[idxSurvey,] %>% mutate(yield=TrueYield) %>% mutate(yield_est_tha=NULL,TrueYield=NULL)
+
+#proxy data from survey locations (used for debiasing in PTD estimator)
+SurveyProxy <- Yield2019Midwest[idxSurvey,] %>% mutate(yield=yield_est_tha) %>% mutate(yield_est_tha=NULL,TrueYield=NULL)
+
+#proxy data from non survey locations (used as first term in PTD estimator)
+nonsurvey_Proxy <- Yield2019Midwest[-idxSurvey,] %>% mutate(yield=yield_est_tha) %>% mutate(yield_est_tha=NULL,TrueYield=NULL)
+
+#ground truth yield data, from all locations (this is not available to the investigator, and is only used for validation)
+AllGroundTruth <- Yield2019Midwest %>% mutate(yield=TrueYield) %>% mutate(yield_est_tha=NULL,TrueYield=NULL)
+```
+
+## Example 1: Estimating corn yield summary statistics
+
+We start by defining a function that takes a corn yield dataset as input and returns the mean, 25th percentile, 75th percentile, and IQR of corn yield. This function is later used as an input argument for the `PTD_bootstrap()` function and the `EstAndGetBootstrapCIs` function. 
+```{r}
+FitQuantsIQRMeans <- function(dfInp,weightsInp=NULL){
+  quantEst <- quantile(dfInp$yield,probs = c(0.25,0.75))
+  IQR_quants_mean <- c(mean(dfInp$yield),quantEst,quantEst[2]-quantEst[1])
+  names(IQR_quants_mean)[1] <- "Mean"
+  names(IQR_quants_mean)[4] <- "IQR"
+  return(IQR_quants_mean)
+}
+```
+
+We next calculate the actual summary statistics, which will be used for validation purposes. The data used to calculate these summary statistics is removed before we test the survey-only, map-only, and PTD approaches.
+```{r}
+#Calculating actual mean, 25th percentile, 75th percentile, and IQR of corn yield
+#This is used for later validation purposes
+TrueTheta <- FitQuantsIQRMeans(dfInp = AllGroundTruth)
+
+#Also calculating regression coefficients which are studied in example 2 and used for validation purposes
+TrueRegCoeffs <- lm(yield~ AverageGrowingSeasonTemp + GrowingSeasonPrecip_mm,data = AllGroundTruth)$coefficients
+
+# Removing ground truth yield data, from all locations (this is not used in subsequent steps)
+rm(AllGroundTruth,Yield2019Midwest)
+```
+
+We next run the survey-only and map-only approaches. To do so it is convenient to define a function that implements the bootstrap to returns confidence intervals for the summary statistics of interest.
+```{r}
+# function that runs the percentile bootstrap (used to get CIs for map-only and survey-only estimates)
+EstAndGetBootstrapCIs <- function(EstAlgorithm,datInp,B=2000,alpha=0.05){
+  pointEst <- EstAlgorithm(datInp)
+  EstsBoot <- matrix(rep(NA,B*length(pointEst)),nrow = B )
+  n <- nrow(datInp)
+
+  for(b in 1:B){
+    idx_boot <- sample(1:n,size = n,replace = T)
+    EstsBoot[b,] <-  EstAlgorithm(datInp[idx_boot,])
+  }
+  
+  
+  out <- list()
+  out$Estimates <- pointEst
+  out$CIs <- t(sapply(data.frame(EstsBoot),
+                                     FUN = function(x) quantile(x,probs = c(alpha/2,1-alpha/2))))
+  
+  rownames(out$CIs) <- names(pointEst)
+  colnames(out$CIs) <- c("lower","upper")
+  return(out)
+}
+```
+
+```{r}
+set.seed(2)
+#Running Survey-only approach
+SurveyOnlyResults <- EstAndGetBootstrapCIs(EstAlgorithm = FitQuantsIQRMeans,datInp = SurveyGT)
+
+#Running Map-only approach
+MapOnlyEstAndCI <- EstAndGetBootstrapCIs(EstAlgorithm = FitQuantsIQRMeans,datInp = AllProxy)
+```
+
+
+We next run the Predict-Then-Debias bootstrap using the `PTD_bootstrap()` from the PTDBoot package. Note that one of the input arguments in `PTD_bootstrap()` is a function that takes a dataset as input and returns summary statistics as an output. The other three inputs to the function are the datasets formatted earlier. 
+```{r}
+#Running PTD_bootstrap() function.
+#Note that one of the inputs is a function that takes a dataset as input and returns summary statistics as an output
+#The other three inputs are datasets 
+PTD_EstAndCI <- PTD_bootstrap(EstAlgorithm = FitQuantsIQRMeans,
+              true_data_completeSamp = SurveyGT,
+              predicted_data_completeSamp =SurveyProxy,
+              predicted_data_incompleteSamp = nonsurvey_Proxy)
+
+```
+
+
+
+Finally we plot the point estimates and confidence intervals and compare against the actual values for the statistics (dashed vertical lines).
+
+```{r}
+#Function that formats and plots the results
+library(ggplot2)
+mkCIplot <- function(PTD_results,SurveyOnly_results,MapOnly_Results,trueParameter,xlabInp,panelTitlesInp){
+  coefNames <- names(PTD_results[['PTD_estimate']])
+  r1 <- data.frame(PTD_results[['PTD_estimate']],PTD_results[['PTD_Boot_CIs']][,'lower'],PTD_results[['PTD_Boot_CIs']][,'upper'],
+                   rep("Predict-Then-Debias",length(trueParameter)),coefNames)
+  r2 <- data.frame(SurveyOnly_results[['Estimates']],SurveyOnly_results[['CIs']][,'lower'],SurveyOnly_results[['CIs']][,'upper'],
+                   rep("Survey-only (n=100)",length(trueParameter)),coefNames)
+  r3 <- data.frame(MapOnly_Results[['Estimates']],MapOnly_Results[['CIs']][,'lower'],MapOnly_Results[['CIs']][,'upper'],
+                   rep("Map-only",length(trueParameter)),coefNames)
+  
+  names(r1) <- names(r2) <- names(r3) <- c("Estimate","CI_lb","CI_ub","Method","Coefficient")
+  ResultsComb <- rbind(r1,r2,r3)
+  
+
+
+  dfTrueCoef <- data.frame(trueParameter,names(trueParameter))
+  names(dfTrueCoef) <- c("trueParameter","Coefficient")
+  dfplt <- left_join(ResultsComb,dfTrueCoef,by="Coefficient")
+    dfplt$Coefficient <- factor(ResultsComb$Coefficient,levels = names(panelTitlesInp),labels = names(panelTitlesInp))
+  
+  
+  dfplt$Method <- factor(dfplt$Method,levels = c("Predict-Then-Debias","Map-only","Survey-only (n=100)"))
+  pltOut <- ggplot(data = dfplt,mapping = aes(x=Estimate,y=Method,color=Method))+geom_point()+geom_errorbar(mapping = aes(y=Method,xmin=CI_lb,xmax=CI_ub,color=Method),width=0.3)+geom_vline(mapping = aes(xintercept=trueParameter),lty="dashed")+facet_wrap(~Coefficient,scales = "free_x",nrow = 1,labeller = labeller(Coefficient = panelTitlesInp
+    ))+theme_bw()+theme(panel.grid = element_blank(),axis.text.y = element_blank(),axis.text.x = element_text(size=7),legend.position = "bottom")+xlab(xlabInp)+ylab("")+scale_color_manual(values = c("green","red","blue"))
+  return(pltOut)
+}
+
+#Plotting results
+panelTitles <- c("Mean" = "Average Corn Yield",
+      "25%" = "25th Percentile of Corn Yield",
+      "75%" = "75th Percentile of Corn Yield",
+      "IQR" = "Interquartile Range (IQR)")
+
+Fig1 <- mkCIplot(PTD_results = PTD_EstAndCI,SurveyOnly_results = SurveyOnlyResults,MapOnly_Results = MapOnlyEstAndCI,trueParameter = TrueTheta,panelTitlesInp=panelTitles,xlabInp="Estimates and 95% Confidence Intervals (t/ha)")
+
+print(Fig1)
+```
+
+
+## Example 2: Estimating regression coefficients
+
+
+```{r}
+#Helper function formatting linear model outputs to point estimates and CIs
+coefTabToEstsAndCIs <- function(CoefTabInp,alpha,estName="Estimate"){
+  Estimates <- CoefTabInp[,estName]
+  CIs <- cbind(CoefTabInp[,estName]-qnorm(1-alpha/2)*CoefTabInp[,'Std. Error'],
+                       CoefTabInp[,estName]+qnorm(1-alpha/2)*CoefTabInp[,'Std. Error'])
+  colnames(CIs) <- c("lower","upper")
+  return(list(Estimates=Estimates,CIs=CIs))
+}
+```
+
+We start by running the survey only and map only approaches. 
+
+```{r}
+#Survey-only Approach
+SurveyOnlyFit <- lm(yield~ AverageGrowingSeasonTemp + GrowingSeasonPrecip_mm,data = SurveyGT)
+CoefTableSurveyOnly <- coeftest(SurveyOnlyFit,vcov. = sandwich)
+SurveyOnly_results_formatted <- coefTabToEstsAndCIs(CoefTableSurveyOnly,alpha = 0.05)
+
+#Map-only Approach
+MapOnlyFit <- lm(yield~ AverageGrowingSeasonTemp + GrowingSeasonPrecip_mm,data = AllProxy)
+CoefTableMapOnly <- coeftest(MapOnlyFit,vcov. = sandwich)
+MapOnly_Results_formatted <- coefTabToEstsAndCIs(CoefTableMapOnly,alpha = 0.05)
+```
+
+We next use the function `PTD_bootstrap.glm()` to implement the Predict-Then-Debias Bootstrap. The outcome variable and covariates in the regression model should be formatted using standard notation in R for the `regFormula.glm` argument. Unlike for the `PTD_bootstrap()`, running `PTD_bootstrap.glm()` does not involve defining a function and using it as an input argument. A computational speedup developed in Kluger et al. (2025) is also available for the glm case and can be implemented by setting `speedup=TRUE`.
+```{r}
+set.seed(3)
+
+PTDBootResults <- PTD_bootstrap.glm(true_data_completeSamp = SurveyGT,
+                  predicted_data_completeSamp = SurveyProxy,
+                  predicted_data_incompleteSamp = nonsurvey_Proxy,
+                  GLM_type = "linear",regFormula.glm = "yield~ AverageGrowingSeasonTemp + GrowingSeasonPrecip_mm",
+                  speedup = TRUE)
+```
+
+Finally we plot the point estimates and confidence intervals and compare against the actual values for the regression coefficients (dashed vertical lines).
+
+
+```{r}
+panelTitlesReg <- c("(Intercept)" = "Intercept",
+      "AverageGrowingSeasonTemp" = "Growing Season Temperature (°C)",
+      "GrowingSeasonPrecip_mm" = "Growing Season Precipitation (mm)")
+
+Fig2 <- mkCIplot(PTD_results = PTDBootResults,SurveyOnly_results = SurveyOnly_results_formatted,MapOnly_Results = MapOnly_Results_formatted,trueParameter = TrueRegCoeffs, panelTitlesInp = panelTitlesReg,xlabInp="Regression Coefficient Estimates and 95% Confidence Intervals")
+
+print(Fig2)
+```
+
+
+
