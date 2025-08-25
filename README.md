@@ -1,4 +1,4 @@
-This repository has an RMarkdown file giving examples that demonstrate how to use the PTDBoot package. It also includes a folder with the processed datasets that were used in the examples.
+This repository has an RMarkdown file titled "Tutorial" giving examples that demonstrate how to use the PTDBoot package. It also includes a folder with the processed datasets that were used in the examples. Finally there is also a RMarkdown file with code that applied some functions from the PTDBoot package to a partially synthetic, corn yield dataset.
 
 ## Dataset citations
 
