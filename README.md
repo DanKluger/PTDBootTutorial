@@ -8,6 +8,7 @@ The housing price and treecover datasets came from:
 > Rolf, E., Proctor, J., Carleton, T., Bolliger, I., Shankar, V., Ishihara, M., Recht, B., and
 Hsiang, S. (2021a). A generalizable and accessible approach to machine learning with
 global satellite imagery. Nature Communications, 12(1):4392.
+> 
 > Rolf, E., Proctor, J., Carleton, T., Bolliger, I., Shankar, V., Ishihara, M., Recht, B., and
 Hsiang, S. (2021b). A generalizable and accessible approach to machine learning with
 global satellite imagery. https://www.codeocean.com/capsule/6456296/tree/v2.
@@ -17,6 +18,7 @@ The AlphaFold dataset had origins and was later processed in:
 > Bludau, I., Willems, S., Zeng, W.-F., Strauss, M. T., Hansen, F. M., Tanzer, M. C., Karayel,
 O., Schulman, B. A., and Mann, M. (2022). The structural context of posttranslational
 modifications at a proteome-wide scale. PLoS biology, 20(5):e3001636.
+> 
 > Angelopoulos, A. N., Bates, S., Fannjiang, C., Jordan, M. I., and Zrnic, T. (2023b).
 Prediction-powered inference: Data sets. 10.5281/zenodo.8397451.
 
